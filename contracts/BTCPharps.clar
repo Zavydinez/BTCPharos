@@ -162,3 +162,232 @@
         next-id
     )
 )
+
+
+
+
+;;;;;;; PUBLIC FUNCTIONS ;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Existing functions from previous implementation
+(define-public (create-loan 
+    (amount uint) 
+    (collateral uint) 
+    (interest-rate uint) 
+    (loan-duration uint)
+)
+    (let
+        (
+            (caller tx-sender)
+            (loan-id (get-next-loan-id))
+        )
+        ;; Validate all inputs
+        (asserts! 
+            (is-valid-input amount collateral interest-rate loan-duration) 
+            ERR-INVALID-INPUT
+        )
+
+        ;; Create loan entry
+        (map-set loans 
+            { loan-id: loan-id }
+            {
+                borrower: caller,
+                lender: caller,
+                amount: amount,
+                collateral: collateral,
+                interest-rate: interest-rate,
+                start-height: stacks-block-height,
+                end-height: (+ stacks-block-height loan-duration),
+                status: "PENDING"
+            }
+        )
+
+        ;; Update user's loan list
+        (map-set user-loans
+            caller
+            (unwrap! 
+                (as-max-len? 
+                    (append 
+                        (default-to (list) (map-get? user-loans caller)) 
+                        loan-id
+                    ) 
+                    u10
+                )
+                ERR-NOT-AUTHORIZED
+            )
+        )
+
+        (ok loan-id)
+    )
+)
+
+
+(define-public (check-and-liquidate (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+            (caller tx-sender)
+        )
+        ;; Additional check for loan-id
+        (asserts! (> loan-id u0) ERR-INVALID-INPUT)
+
+        ;; Ensure loan is not already liquidated or repaid
+        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-FOUND)
+
+        ;; Calculate current collateral ratio
+        (let
+            (
+                (current-ratio 
+                    (calculate-current-collateral-ratio 
+                        (get amount loan) 
+                        (get collateral loan)
+                    )
+                )
+            )
+            ;; Check if loan is below liquidation threshold
+            (asserts! (< current-ratio LIQUIDATION-THRESHOLD) ERR-INSUFFICIENT-COLLATERAL)
+
+            ;; Calculate liquidation amount with penalty
+            (let
+                (
+                    (penalty-multiplier LIQUIDATION-PENALTY)
+                    (liquidation-amount 
+                        (/ 
+                            (* (get amount loan) penalty-multiplier) 
+                            u100
+                        )
+                    )
+                )
+                ;; Update loan status to liquidated
+                (map-set loans
+                    { loan-id: loan-id }
+                    (merge loan {
+                        status: "LIQUIDATED",
+                        collateral: u0
+                    })
+                )
+
+                ;; Record liquidation details
+                (map-set liquidations
+                    { loan-id: loan-id }
+                    {
+                        liquidator: caller,
+                        liquidation-height: stacks-block-height,
+                        liquidation-amount: liquidation-amount
+                    }
+                )
+
+                (ok liquidation-amount)
+            )
+        )
+    )
+)
+
+;; Partial collateral withdrawal function
+(define-public (withdraw-excess-collateral 
+    (loan-id uint) 
+    (withdrawal-amount uint)
+)
+    (let
+        (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+            (caller tx-sender)
+        )
+        ;; Additional check for loan-id
+        (asserts! (> loan-id u0) ERR-INVALID-INPUT)
+
+        ;; Validate inputs
+        (asserts! (is-eq (get borrower loan) caller) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-FOUND)
+
+        ;; Calculate maximum withdrawable amount
+        (let
+            (
+                (max-withdrawable 
+                    (calculate-max-withdrawable-collateral 
+                        (get collateral loan) 
+                        (get amount loan)
+                    )
+                )
+            )
+            ;; Ensure withdrawal amount is valid
+            (asserts! (> withdrawal-amount u0) ERR-INVALID-INPUT)
+            (asserts! (<= withdrawal-amount max-withdrawable) ERR-INSUFFICIENT-EXCESS-COLLATERAL)
+
+            ;; Update loan with reduced collateral
+            (map-set loans
+                { loan-id: loan-id }
+                (merge loan {
+                    collateral: (- (get collateral loan) withdrawal-amount)
+                })
+            )
+
+            ;; Transfer collateral back to borrower (placeholder)
+            (ok withdrawal-amount)
+        )
+    )
+)
+
+
+(define-public (fund-loan (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+            (caller tx-sender)
+        )
+        ;; Additional validation for loan-id
+        (asserts! (> loan-id u0) ERR-INVALID-INPUT)
+
+        (asserts! (is-eq (get status loan) "PENDING") ERR-LOAN-ALREADY-ACTIVE)
+        (asserts! (not (is-eq (get borrower loan) caller)) ERR-NOT-AUTHORIZED)
+
+        ;; Update loan status and set lender
+        (map-set loans
+            { loan-id: loan-id }
+            (merge loan {
+                lender: caller,
+                status: "ACTIVE"
+            })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (repay-loan (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+            (caller tx-sender)
+        )
+        ;; Additional validation for loan-id
+        (asserts! (> loan-id u0) ERR-INVALID-INPUT)
+
+        (asserts! (is-eq (get borrower loan) caller) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-FOUND)
+
+        ;; Calculate repayment amount with interest
+        (let
+            (
+                (interest-amount (calculate-interest
+                    (get amount loan)
+                    (get interest-rate loan)
+                    (- stacks-block-height (get start-height loan))
+                ))
+                (total-repayment (+ (get amount loan) interest-amount))
+            )
+
+            ;; Update loan status
+            (map-set loans
+                { loan-id: loan-id }
+                (merge loan {
+                    status: "REPAID"
+                })
+            )
+
+            (ok true)
+        )
+    )
+)
+
